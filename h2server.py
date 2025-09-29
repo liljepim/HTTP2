@@ -1,63 +1,20 @@
-import datetime
 import json
-import random
 import socket
 
 import h2.config
 import h2.connection
 import h2.events
 
-message_counter = 1
-
-
-def generate_message_id():
-    global message_counter
-    message_id = f"msg_{message_counter:04d}"
-    message_counter += 1
-    return message_id
-
-
-def generate_payload(
-    node_id="node_01",
-    application_protocol=None,
-    transport_protocol=None,
-    packet_type="sensor_reading",
-    sensor_type="combined_environmental",
-    retransmission_count=0,
-):
-    app_protocols = ["CoAP", "HTTP", "MQTT"]
-    transport_protocols = ["QUIC", "TCP", "UDP"]
-
-    application_protocol = application_protocol or random.choice(app_protocols)
-    transport_protocol = transport_protocol or random.choice(transport_protocols)
-
-    payload = {
-        "message_id": generate_message_id(),
-        "timestamp": datetime.datetime.now().isoformat(),
-        "node_id": node_id,
-        "application_protocol": application_protocol,
-        "transport_protocol": transport_protocol,
-        "kb_estimate": round(random.uniform(0.75, 1.25), 2),
-        "retransmission_count": retransmission_count,
-        "sensor_readings": {
-            "temperature": round(random.uniform(18.0, 35.0), 1),
-            "soil_moisture": round(random.uniform(10.0, 60.0), 1),
-            "humidity": round(random.uniform(30.0, 90.0), 1),
-        },
-        "packet_type": packet_type,
-        "sensor_type": sensor_type,
-    }
-
-    return payload
+# from payload_generator import generate_payload
 
 
 def send_response(conn, event):
     stream_id = event.stream_id
-    # response_data = json.dumps(
-    #     {k.decode("utf-8"): v.decode("utf-8") for k, v in event.headers}
-    # ).encode("utf-8")
+    response_data = json.dumps(
+        {k.decode("utf-8"): v.decode("utf-8") for k, v in event.headers}
+    ).encode("utf-8")
 
-    response_data = json.dumps(generate_payload()).encode("utf-8")
+    # response_data = json.dumps(generate_payload()).encode("utf-8")
 
     conn.send_headers(
         stream_id=stream_id,
@@ -71,11 +28,54 @@ def send_response(conn, event):
     conn.send_data(stream_id=stream_id, data=response_data, end_stream=True)
 
 
-def handle(sock):
-    config = h2.config.H2Configuration(client_side=False)
+def handle_request(method, path, body):
+    """
+    Handle client requests and returns the response data to be sent to client
+
+    Args:
+        method (str): GET or POST
+        path (str): Path requested e.g. /sensor, /alert
+        body: request body in byte-like format
+
+    Return(s):
+        dict: Response data to send to client
+        int: Response code (200:OK, 400: Bad Request)
+    """
+
+    # Handle Post Requests
+
+    if method == "POST":
+        if path == "/sensor":  # Received sensor data from sensor nodes
+            try:
+                data = json.loads(body.decode("utf-8"))
+                print(f"Received Sensor Data: {data}")
+                return (
+                    {"status": "Sensor data received", "data": data},
+                    200,
+                )  # Echo data to client (only for debugging, can be omitted to maximize performance)
+            except Exception as e:
+                return {"error": f"Invalid JSON: {str(e)}"}, 400
+        elif path == "/alert":
+            try:
+                data = json.loads(body.decode("utf-8"))
+                print(f"Received Alert Data: {data}")
+                return (
+                    {"status": "Alert data received", "data": data},
+                    200,
+                )  # Echo data to client (only for debugging, can be omitted to maximize performance)
+            except Exception as e:
+                return {"error": f"Invalid JSON: {str(e)}"}, 400
+    else:
+        return {"error", "Not Found"}, 404
+
+
+def handle_client(sock):
+    config = h2.config.H2Configuration(client_side=False, header_encoding="utf-8")
     conn = h2.connection.H2Connection(config=config)
     conn.initiate_connection()
     sock.sendall(conn.data_to_send())
+
+    streams = {}
 
     while True:
         data = sock.recv(65535)
@@ -85,11 +85,37 @@ def handle(sock):
         events = conn.receive_data(data)
         for event in events:
             if isinstance(event, h2.events.RequestReceived):
-                send_response(conn, event)
+                headers = dict(event.headers)
+                method = headers.get(":method")
+                path = headers.get(":path")
+                streams[event.stream_id] = {"body": b"", "method": method, "path": path}
 
-        data_to_send = conn.data_to_send()
-        if data_to_send:
-            sock.sendall(data_to_send)
+            elif isinstance(event, h2.events.DataReceived):
+                streams[event.stream_id]["body"] += event.data
+                conn.acknowledge_received_data(
+                    event.flow_controlled_length, event.stream_id
+                )
+
+            elif isinstance(event, h2.events.StreamEnded):
+                req = streams.pop(event.stream_id)
+                method, path, body = req["method"], req["path"], req["body"]
+
+                payload, status = handle_request(method, path, body)
+                response = json.dumps(payload).encode("utf-8")
+
+                conn.send_headers(
+                    event.stream_id,
+                    headers=[
+                        (":status", str(status)),
+                        ("content-type", "application/json"),
+                        ("content-length", str(len(response))),
+                    ],
+                )
+                conn.send_data(event.stream_id, response, end_stream=True)
+
+        sock.sendall(conn.data_to_send())
+
+    sock.close()
 
 
 sock = socket.socket()
@@ -98,4 +124,4 @@ sock.bind(("0.0.0.0", 8080))
 sock.listen(5)
 
 while True:
-    handle(sock.accept()[0])
+    handle_client(sock.accept()[0])
